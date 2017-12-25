@@ -1,0 +1,193 @@
+Because of design limitations JOS will use only the first 256MB of a PC's physical memory
+
+(gdb) si
+[f000:d167]    0xfd167:	out    %al,$0x70
+0x0000d167 in ?? ()
+(gdb) si
+[f000:d169]    0xfd169:	in     $0x71,%al
+0x0000d169 in ?? ()
+(gdb) si
+[f000:d16b]    0xfd16b:	in     $0x92,%al #Why bother to IN twice?
+0x0000d16b in ?? ()
+(gdb) si
+[f000:d16d]    0xfd16d:	or     $0x2,%al
+0x0000d16d in ?? ()
+(gdb) si
+[f000:d16f]    0xfd16f:	out    %al,$0x92
+0x0000d16f in ?? ()
+(gdb) si
+
+JOS Lab1实习报告
+代超 计算机系
+1400011714
+
+简介
+
+配置工作环境
+QEMU
+QEMU是一种用来模拟计算机系统的软件。【JOS如何与QEMU配合？】安装过程如下：
+git clone http://web.mit.edu/ccutler/www/qemu.git -b 6.828-2.3.0
+安装libsdl1.2-dev, libtool-bin, libglib2.0-dev, libz-dev和libpixman-1-dev
+./configure --disable-kvm --target-list="i386-softmmu x86_64-softmmu"（QEMU将被安装在/usr/local目录下）
+make && sudo make install
+
+
+编译工具
+用C语言编写完JOS后，我们需要一系列编译工具来将它转化为ELF格式的二进制文件，以便QEMU运行，而我的Ubuntu 16.04系统已经提前备好了这些工具。
+
+JOS
+用如下方式下载JOS
+【1.png】
+
+Part 1: PC Bootstrap
+Getting Started with x86 assembly
+该部分主要用来熟悉x86汇编语言。我下载了IA-32 Intel Architecture Software Developer's Manuals方便以后查询。
+Simulating the x86
+我们需要把GNUMakefile文件的第310行的false语句用“#”注释掉，然后在lab文件夹下make就可以得到JOS的原始版。注意，如果不作修改，那么终端会显示Lab已经过期，make失败。
+
+执行make qemu就能看到JOS的kernel monitor，并且只能执行help与kerninfo命令。
+【2.png】
+The PC's Physical Address Space
+该部分介绍了32位x86机器的物理内存地址的分布（如图所示），并指出JOS只使用了其中最开始的256MB。【3.png】
+The ROM BIOS
+在一个终端用make qemu-gdb以debug模式启动qemu，再在另一个终端执行make gdb，就可以远程调试QEMU。
+【4.png】
+按照上面的方法，我得到了ROM BIOS的前25步操作：
+1	[f000:fff0]    0xffff0:	ljmp   $0xf000,$0xe05b
+2	[f000:e05b]    0xfe05b:	cmpl   $0x0,%cs:0x6ac8
+3	[f000:e062]    0xfe062:	jne    0xfd2e1
+4	[f000:e066]    0xfe066:	xor    %dx,%dx
+5	[f000:e068]    0xfe068:	mov    %dx,%ss
+6	[f000:e06a]    0xfe06a:	mov    $0x7000,%esp
+7	[f000:e070]    0xfe070:	mov    $0xf34c2,%edx
+8	[f000:e076]    0xfe076:	jmp    0xfd15c
+9	[f000:d15c]    0xfd15c:	mov    %eax,%ecx
+10	[f000:d15f]    0xfd15f:	cli    
+11	[f000:d160]    0xfd160:	cld    
+12	[f000:d161]    0xfd161:	mov    $0x8f,%eax
+13	[f000:d167]    0xfd167:	out    %al,$0x70
+14	[f000:d169]    0xfd169:	in     $0x71,%al
+15	[f000:d16b]    0xfd16b:	in     $0x92,%al
+16	[f000:d16d]    0xfd16d:	or     $0x2,%al
+17	[f000:d16f]    0xfd16f:	out    %al,$0x92
+18	[f000:d171]    0xfd171:	lidtw  %cs:0x6ab8
+19	[f000:d177]    0xfd177:	lgdtw  %cs:0x6a74
+20	[f000:d17d]    0xfd17d:	mov    %cr0,%eax
+21	[f000:d180]    0xfd180:	or     $0x1,%eax
+22	[f000:d184]    0xfd184:	mov    %eax,%cr0
+23	[f000:d187]    0xfd187:	ljmpl  $0x8,$0xfd18f
+
+	The target architecture is assumed to be i386
+24	=> 0xfd18f:	mov    $0x10,%eax
+25	=> 0xfd194:	mov    %eax,%ds
+……
+可以看出，QEMU的第一步操作是跳转到地址0xfe05b，然后进行一次条件转移——这很可能是一个循环结构。10-11步cli和cld将EFLAGS寄存器中IF和DF位置零。12-13步设置CMOS/RTC的地址端口，0x8f表示禁止NMI中断，14步是一次空读操作，以避免RTC芯片陷入未定义的状态。15-17步启用A20地址线，即启用“地址环绕”机制。18-19步设置中断描述符表寄存器和全局描述符表寄存器。20-22步启用保护模式（开机时默认为实模式）。
+
+The Boot Loader
+【5.png】
+
+At what point does the processor start executing 32-bit code? What exactly causes the switch from 16- to 32-bit mode?
+在boot.S的第49-51行，CR0的最低位被置为1，标志着保护模式的开启。
+
+What is the last instruction of the boot loader executed, and what is the first instruction of the kernel it just loaded?
+从boot.asm中可以看出，bootmain函数的最后一句((void (*)(void)) (ELFHDR->e_entry))(); call *0x10018就是boot loader的最后一句。内核的第一句是0x10000c:	movw   $0x1234,0x472
+【6.png】
+Where is the first instruction of the kernel?
+【7.png】
+在地址0xf0100000处
+
+How does the boot loader decide how many sectors it must read in order to fetch the entire kernel from disk? Where does it find this information?
+在boot/main.c，bootmain函数先将磁盘上的前4KB读出（包含kernel的ELF文件头），写入内存，起始地址为0x10000。然后，第51-52行在kernel的ELF文件头中找到sector的数量，53-56行通过for循环逐个将其读入。
+【8.png】
+
+Loading the Kernel
+【9.png】
+【10.png】
+将7c00改为7c10，【11,12.png】
+回头看改动前的相应部分【13.png】，发现这里的地址是相对地址。
+找出跳转到此处的语句：
+[15-16.png]在此设置断点，发现编码出现错误。ljmp的目标地址0x7c42处根本没有合法指令，而本应跳转到的目标0x7c32处却出现了错误：66 b8 10 00 8e d8本应解读为mov $0x10, %ax和mov %eax, %ds，实际上却解读为mov $d88e0010, %eax。因此，如果改动装载地址，造成的后果便是地址冲突，编码混乱，产生错误。【17-18.png】也说明了这一现象。
+
+【19.png】
+显然，刚开始运行boot loader时，1M以上的地址均没有内容，因为内核代码还没有进入RAM。刚开始运行内核时，1M处的代码就是内核最开始的代码，如图所示。【20-21.png】
+
+The Kernel
+Using virtual memory to work around position dependence
+【23.png】
+这部分的handout指出，在cr0寄存器的CR0_PG位被设置为1后，系统将启用地址映射机制，此后所有出现在代码中的地址都不再被当作物理地址，而会被当作虚拟地址，经过页表和MMU转换，得到物理地址。目前的页表只支持0xf0000000-0xf0400000和0x000000-0x400000的虚拟地址范围，任何其他范围的地址都会引起page fault。由于中断处理系统尚未建立，QEMU会直接退出。【22.png】如图所示，执行movl %eax, %cr0后，MMU参与地址转换，将原本为空的0xf0100000映射到了0x100000，即内核代码的起始地址。
+
+将entry.S中的movl %eax, %cr0注释掉，再重新make后，得到如下结果
+【24.png】
+错误信息：qemu: fatal: Trying to execute code outside RAM or ROM at 0xf010002c
+可以看出，由于取消了地址转换，0xf01002c被当做了非法的物理地址。
+Formatted Printing to the Console
+理解了printfmt.c的代码后，很容易实现八进制输出格式：只要将vprintfmt函数的case 'o'的内容改为下图所示即可。【25.txt】
+Be able to answer the following questions:
+
+Explain the interface between printf.c and console.c. Specifically, what function does console.c export? How is this function used by printf.c?
+cprintf vcprintf vprintfmt putch cputchar cons_putc [serial_putc, lpt_putc, cga_putc]
+
+Explain the following from console.c:
+1      if (crt_pos >= CRT_SIZE) {
+2              int i;
+3              memmove(crt_buf, crt_buf + CRT_COLS, (CRT_SIZE - CRT_COLS) * sizeof(uint16_t));
+4              for (i = CRT_SIZE - CRT_COLS; i < CRT_SIZE; i++)
+5                      crt_buf[i] = 0x0700 | ' ';
+6              crt_pos -= CRT_COLS;
+7      }
+查阅console.h可知宏定义CRT_ROWS = 25, CRT_COLS = 80, CRT_SIZE = CRT_ROWS * CRT_COLS，结合代码的上下文，不难推测，该程序将屏幕的每个显示单元从左至右、从上至下编号为0~1999，变量crt_pos存储了光标位置，crt_buf存储了屏幕上所有显示单元的信息。
+这段代码在光标超出屏幕范围时运行，先将下24排向上挪一排，然后将最下面一排置为空白，再将光标向上移动一排，起到换行的作用。
+
+Trace the execution of the following code step-by-step:
+
+int x = 1, y = 3, z = 4;
+cprintf("x %d, y %x, z %d\n", x, y, z);
+In the call to cprintf(), to what does fmt point? fmt指向cprintf的第一个参数，也就是字符串"x %d, y %x, z %d\n"。
+To what does ap point? ap指向cprintf的参数列表的第一个元素，也就是fmt。
+List (in order of execution) each call to cons_putc, va_arg, and vcprintf.
+For cons_putc, list its argument as well.
+(gdb) step
+=> 0xf01002fd <cons_putc+11>:	mov    $0x0,%ebx
+cons_putc (c=120) at kern/console.c:70
+参数的值为120，即0x78，第一个输出字符'x'的ASCII码。
+For va_arg, list what ap points to before and after the call.
+调用之前，ap指向第一个参数，调用之后，ap指向第二个参数
+
+Run the following code.
+    unsigned int i = 0x00646c72;
+    cprintf("H%x Wo%s", 57616, &i);
+What is the output? He110 World
+Explain how this output is arrived at in the step-by-step manner of the previous exercise.
+57616的十六进制是0xe110，0x00646c72对应的ASCII码为"\0dlr"，但由于x86是小端机器，实际上解读的字符串是"rld\0"，合起来就是"He110 World\0"，被打印到终端。
+The output depends on that fact that the x86 is little-endian. If the x86 were instead big-endian what would you set i to in order to yield the same output? 
+Would you need to change 57616 to a different value?
+57616不需要改动，因为vprintfmt处理%x标记时57616将作为数值处理，与机器代码无关；i应该改为"0x726c6400"，因为vprintfmt处理%s标记时，会按照内存地址的顺序逐字节地读取i，大端法机器与小端法机器的顺序相反。
+
+In the following code, what is going to be printed after 'y='? (note: the answer is not a specific value.) Why does this happen?
+    cprintf("x=%d y=%d", 3);
+x=3 y=-267321412
+因为cprintf会对每个%d标志调用一次va_arg，读取指针ap指向的数据，并将指针向后移动。处理完第一个%d后，ap已经移到了列表之外，因此处理第二个%d时，读取到的数值是不确定的，从而y也是不确定的。
+Let's say that GCC changed its calling convention so that it pushed arguments on the stack in declaration order, so that the last argument is pushed last. How would you have to change cprintf or its interface so that it would still be possible to pass it a variable number of arguments?
+va_start和va_arg决定了参数列表的顺序，从inc/stdarg.h中得知，这两个函数被定义成GCC内置的__builtin_va_start和__builtin_va_arg。如果GCC改变了参数的压栈顺序，就应该修改对应函数中ap指针的增减方向。
+
+The Stack
+[27.png]
+【28.png】
+entry.S第74行movl $0x0,%ebp和第77行movl $(bootstacktop),%esp将%ebp和%esp初始化，第92-94行定义了内核栈。
+第一个部分.space为内核栈预留了32KB空间（KSTKSIZE在inc/memlayout.h中定义），第二个部分.globl定义了bootstacktop变量，即%esp的初始值0x8000，恰好等于32KB。该值通过objdump -x obj/kern/entry.o得到：【29.png】
+总而言之，内核栈大小为32KB，初始为空，从高地址向低地址增长。
+【30.png】
+【31.png】
+如图所示，我在递归的最深层设置了断点，并观察栈内情况。0xf0100068是test_backtrace的返回地址，接下来7个32-bit words分别是递归调用test_backtrace的参数，5个为临时变量预留的空间，以及旧的ebp指针。
+【32.png】
+mon_backtrace是在test_backtrace的最深层递归中调用的，其作用是显示栈中的信息。
+【34.png】
+上图说明，执行call之前，参数被压入栈中，然后执行call时，返回地址被压栈。
+【35.png】
+上图说明，在进入mon_backtrace之后，旧的%ebp先被压栈，%esp的值被赋给%ebp。因此，在mon_backtrace正式开始读取栈的内容之前，从%ebp开始，栈的内容依次为（地址由低到高）：上层的%ebp（%ebp之间形成了链），返回上层的地址，以及上层调用该层的参数。参数压栈的顺序是从右到左，因此最左边的参数会在地址最低的地方。根据这些特点，我实现了mon_backtrace：
+[33.png]
+它先读出%ebp的值，然后依次读出%eip和参数的值，再根据%ebp链向上追溯，直到到达内核栈（%ebp=0）。
+【36.png】
+stab是ELF文件中的符号表节【37.png】，由若干条目组成，每个条目的结构如图【38.png】。根据inc/stab.h中的宏以及Stab结构的定义，可以发现n_type=SLINE的条目代表行数，具体的行数存放在n_desc中。在了解stab_binsearch函数的功能后，我仿照debuginfo_eip查找文件和函数的方式，在它里面实现了查找行数的功能【39.png】，并修改了mon_backtrace【40.png】。
+在monitor.c的commands[]里加一行对应的条目就能在命令行里运行backtrace了：【41.png】
+

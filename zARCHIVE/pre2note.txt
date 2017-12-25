@@ -1,0 +1,27 @@
+Kernel何时启动fs进程？
+在调用boot_aps()启动完所有CPU之后，由ENV_CREATE(fs_fs, ENV_TYPE_FS)创建
+
+fs进程的主函数是谁？
+umain() defined in fs/serv.c
+由链接方式决定，一切进程的入口都在lib/entry.S，它调用libmain，libmain调用umain
+serve_init(); //初始化系统打开文件表
+fs_init(); //找到一块IDE(Integrated Drive Electronics)“磁盘”，调用ide_probe_disk1()
+//for (x = 0; x < 1000 && ((r = inb(0x1F7)) & (IDE_BSY|IDE_DF|IDE_ERR)) != 0; x++);
+	fs_test();
+serve(); //守护进程，后面会用到
+
+fs进程的代码在哪个disk？
+disk1
+
+disk0和disk1上面分别有什么，怎么生成的？
+disk0: kernel image
+disk1: file system image
+Note that the GNUmakefile file in this lab sets up QEMU to use the file obj/kern/kernel.img as the image for disk 0 (typically "Drive C" under DOS/Windows) as before, and to use the (new) file obj/fs/fs.img as the image for disk 1 ("Drive D"). In this lab our file system should only ever touch disk 1; disk 0 is used only to boot the kernel.
+
+QEMUOPTS = -drive file=$(OBJDIR)/kern/kernel.img,index=0,media=disk,format=raw -serial mon:stdio -gdb tcp::$(GDBPORT)
+QEMUOPTS += $(shell if $(QEMU) -nographic -help | grep -q '^-D '; then echo '-D qemu.log'; fi)
+IMAGES = $(OBJDIR)/kern/kernel.img
+QEMUOPTS += -smp $(CPUS)
+QEMUOPTS += -drive file=$(OBJDIR)/fs/fs.img,index=1,media=disk,format=raw
+IMAGES += $(OBJDIR)/fs/fs.img
+QEMUOPTS += $(QEMUEXTRA)

@@ -1,0 +1,39 @@
+JOS Challenges
+
+Lab 2: Memory Management
+[ch2.png]
+该挑战要求扩展kernel monitor，使其支持三种新命令：
+1. 打印给定范围内虚拟内存的映射关系；
+2. 修改任一虚拟页面的权限位；
+3. 打印给定范围内虚拟/物理内存的内容。
+实际上，无论要加入什么命令，都只用遵循以下步骤：
+1. 在monitor.c中修改commands数组，加入命令名/命令描述/调用函数；
+2. 在monitor.h中声明调用函数；
+3. 在monitor.c中实现调用函数。
+
+showmap命令。它既能在某一范围内查找，也能打印出单个页面的映射情况。首先将参数值与页面对齐，然后在for循环中调用pgdir_walk函数（create=0），得到对应页表条目的位置，最后将具体的信息打印出来。
+[ch2-1.png]
+
+setperm命令。它用pgdir_walk函数（create=1）得到页表条目的位置，然后修改低12位即可。
+[ch2-2.png]
+
+showmem命令。它有一个可选参数[-v | -p]，分别表示后面的地址是虚拟地址或者物理地址，-v是默认值。由于整个物理内存都被映射到了从KERNBASE开始的虚拟地址，因此只要将物理地址加上KERNBASE，就能方便地访问内存。此外，我还加入判定，不允许访问过高的/不存在的物理内存。
+[ch2-3A.png]
+[ch2-3B.png]
+
+Lab 3: User Environments
+[ch3.png]
+该挑战要求在kernel monitor加入continue命令，使被中断的用户进程能从断点处继续执行，并且只执行一条指令，然后再返回内核终端。
+TF Trap (bit 8) — Set to enable single-step mode for debugging; clear to disable single-step mode. In single-step mode, the processor generates a debug exception after each instruction. This allows the execution state of a program to be inspected after each instruction. (Vol. 3A 2-9)
+
+此外，因debug exception而中断的进程，其Trapframe里的CS和EIP都会指向下一条即将运行的指令，因此我们只需让进程不断产生debug exception就行了。具体方法如下：
+修改trap_dispatch函数，使产生debug exception的进程最终进入kernel monitor；
+修改monitor.c，添加continue命令。该命令将原用户进程的EFLAGS寄存器的TF位置为1，再恢复其运行。这样，当我们在kernel monitor执行continue命令时，它会执行下一条指令，然后又产生debug exception，从而回到kernel monitor。
+continue命令的实现函数如下：
+int mon_continue(int argc, char **argv, struct Trapframe *tf) {
+	tf->tf_eflags |= FL_TF;
+	env_run(curenv);
+	return 0;
+}
+
+Lab 4: Preemptive Multitasking

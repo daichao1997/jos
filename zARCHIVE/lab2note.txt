@@ -1,0 +1,81 @@
+Do all of the regular exercises described in the lab and at least one challenge problem.
+
+Write up brief answers to the questions posed in the lab and a short (e.g., one or two paragraph) description of what you did to solve your chosen challenge problem.
+
+Place the write-up in a file called answers-lab2.txt in the top level of your lab directory before handing in your work.
+
+This lab, and all the 6.828 labs, will require you to do a bit of detective work to figure out exactly what you need to do.
+
+write the physical page allocator
+keep track of which parts of physical RAM are free or in use
+#define	KERNBASE	0xF0000000
+#define KSTACKTOP	KERNBASE
+#define MMIOBASE	(MMIOLIM - PTSIZE)
+#define ULIM		(MMIOBASE)
+#define UVPT		(ULIM - PTSIZE)
+#define UPAGES		(UVPT - PTSIZE)
+
+#define PGSIZE		4096		// bytes mapped by a page
+#define NPDENTRIES	1024		// page directory entries per page directory
+#define PTSIZE		(PGSIZE*NPTENTRIES) // bytes mapped by a page directory entry
+
+#define ROUNDUP(a, n)	Round up to the nearest multiple of n
+
+Introduction
+【任务目标】
+本次Lab的主要目的是实现存储管理系统，分为三步。
+第一步是建立对物理页面的管理，主要任务是记录“空闲页面”和“已分配页面”，以保证内存之间不会相互覆盖，具体实现方式是为每个物理页面记录一个PageInfo结构，并用page_free_list链表记录空闲页面。
+第二步是建立虚拟内存管理系统，主要任务是建立页目录和页表，具体实现方式是几个对页表进行操作的函数。
+第三步是为内核分配虚拟地址空间，只用直接调用第二步实现的函数即可。
+【上下文环境】
+本次Lab的核心是kern/pmap.c中的mem_init函数，它为JOS构筑存储管理系统。它被i386_init()调用，是进入monitor前的最后一步（就目前的JOS而言），此时保护模式已开启。从entry.S的57-62行得知，此时CR3的值是entry_pgdir。该页目录在kern/entrypgdir.c中定义，只支持0-4MB范围的地址转换，目的是暂时支撑存储管理系统本身。【0.png】
+
+建立好这些基本环境后，我们就可以开始搭建mem_init()本身了。
+Part 1: Physical Page Management
+【1.png】
+先说说体会吧。看到题目后，我想先实现boot_alloc()。虽然文档里把要做的事情说得很清楚，但我发现自己根本无从下手。平常写小程序的时候我可以自由发挥，但是写JOS时，我的程序必须建立在一个固定的体系之上。如果不先弄清这个体系的框架，那无论如何都写不出正确的代码。
+回到boot_alloc函数，该函数要求我“allocate enough pages of contiguous physical memory to hold n bytes”。
+这里的关键是要理解“allocate”的具体含义。一般来说，只有空闲的页面才能分配出去，所以我想找到记录这些信息的数据结构。然而，boot_alloc()在mem_init()的第四句话就被调用了，此时pages数组根本不存在。
+那么我怎么知道哪些页面是“空闲”的呢？我观察到boot_alloc里给出了end指针变量，从它指向的地址开始，没有存储任何内核代码或全局变量。也就是说，只要我从end开始依次分配空间，就能不影响其他代码。
+但是，我又产生了一个疑问：分配的页面怎么回收呢？我阅读了后面的文档，才得到了答案：page_init()的文档提到，在page_init()完成后应该弃用boot_alloc()，转而使用page_alloc()，而page_init()的作用是初始化pages数组。综上可以看出，boot_alloc()的功能是为存储系统本身分配空间，因此根本不用回收。
+终于，在弄清这个函数在整个体系中所起的作用后，我放心地实现了这个并不复杂的函数。我把这个熟悉过程称作“预热”，在预热过后，后面的函数就很容易写了。
+【2.png】
+写page_init()之前，要分析清楚PageInfo如何表示空闲页面，又如何表示已分配页面。答案是，空闲页面的pp_ref为0且pp_link处于以page_free_list为头的链表中（链表尾的pp_link可以为NULL），已分配页面的pp_ref不为0且pp_link为NULL。
+【3.png】
+page_alloc和page_free都是针对链表的操作，比较简单。
+【4.png】
+
+Part 2: Virtual Memory
+【5.png】
+保护模式下，所有指针的内容都被当做虚拟地址。因此，为了正确地解引用，x的类型应该是uintptr_t。
+【6.png】
+这次我要实现的函数都是通用性的，因此必须考虑所有可能的情况。例如，pgdir_walk可能遇到页表页不存在或申请页面失败的情况，还要处理不同的create参数。注意，在生成新页目录项时，尽量给它多赋予权限，使其包含其对应页表页里所有页表项的权限。这样，如果想知道某个页面的权限，只用看它的页表项就行了。
+【7.png】
+在pgdir_walk()的基础上，参照给出的文档，page_insert()，page_lookup()和page_remove()都很容易实现。实现过程中，需要注意函数返回的指针可能为NULL，页表项present位可能为0，页面可能申请失败。
+【8-10.png】
+boot_map_region()的用途比较特殊，它将之前用boot_alloc()申请的区域收入页表，而这些页面之前已经在page_init()里增加过pp_ref了，因此不能像page_insert()那样再增加一次。
+【11.png】
+Part 3: Kernel Address Space
+【12.png】
+boot_map_region(kern_pgdir, UPAGES, npages*sizeof(struct PageInfo), PADDR(pages), PTE_U | PTE_P);
+boot_map_region(kern_pgdir, KSTACKTOP - KSTKSIZE, KSTKSIZE, PADDR(bootstack), PTE_P);
+boot_map_region(kern_pgdir, KERNBASE, (2^32) - KERNBASE, (physaddr_t)0, PTE_P | PTE_W);
+
+What entries (rows) in the page directory have been filled in at this point? What addresses do they map and where do they point?
+1023-960 Page table for top 256MB of phys memory
+959 Page table for kernel stack
+956 Page table for pages[]
+We have placed the kernel and user environment in the same address space. Why will user programs not be able to read or write the kernel's memory? What specific mechanisms protect the kernel memory?
+用户程序可能会破坏内核数据，导致系统崩溃，后果非常严重。如果用户程序真的需要内核数据，可以通过系统调用获得。具体的防护机制是在内核的页表项中设置权限。
+What is the maximum amount of physical memory that this operating system can support? Why?
+根据memlayout.h提供的宏定义，留给pages数组的空间为PTSIZE，即4MB；PageInfo结构大小为6字节。如果不考虑边缘对齐，那么JOS理论上最多能管理PGSIZE*PTSIZE/6=2.67GB。
+How much space overhead is there for managing memory, if we actually had the maximum amount of physical memory? How is this overhead broken down?
+页表和页目录占据PGSIZE*(1+NPDENTRIES)=4MB，加上pages数组的4MB，共8MB。如果想减小开销，可以在一个小于4MB的缓存池中动态地分配和回收页表页。
+Revisit the page table setup in kern/entry.S and kern/entrypgdir.c. Immediately after we turn on paging, EIP is still a low number (a little over 1MB). At what point do we transition to running at an EIP above KERNBASE? What makes it possible for us to continue executing at a low EIP between when we enable paging and when we begin running at an EIP above KERNBASE? Why is this transition necessary?
+如图所示，entry_pgdir下属的页表同时将虚拟地址[0, 4MB)和[KERNBASE, KERNBASE+4MB)映射到了物理地址[0, 4MB)，因此只要EIP在4MB以下就可以照常运行。entry.S的67-68行有语句
+	mov	$relocated, %eax
+	jmp	*%eax
+kernel的ELF文件头的.text节的VMA为0xf0100000，LMA为0x100000。在执行jmp之前，EIP指向的是relocated对应的物理地址；执行jmp之后，EIP被设置为relocated的虚拟地址，跳转到了KERNBASE之上（但对应的物理地址不变）。
+这个转换之所以必要，是因为entry_pgdir只是一个暂时的页目录，之后必须被kern_pgdir所代替。然而kern_pgdir既没有在此时映射UTOP以下的地址，也不会在将来映射4M以下的地址，因此会引发错误。
+【13.png】
+

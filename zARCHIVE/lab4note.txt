@@ -1,0 +1,241 @@
+Lab 4: Preemptive Multitasking
+
+Part A: Multiprocessor Support and Cooperative Multitasking
+
+Multiprocessor Support
+【1.png】
+值得注意的是参数pa和size都不一定和页面对齐，因此既要将pa向下对齐，又要将pa+size向上对齐，再以此范围分配页面。
+【2.png】
+【3.png】
+在处理到MPENTRY_PADDR时加一个特判即可。为了方便表示，我定义了宏操作
+【6.png】
+简化后的代码如下
+【7.png】
+【4.png】
+我们希望mpentry.S中的代码能从16位低物理地址MPENTRY_PADDR开始执行，因此我们在boot_aps中手动把代码拷贝到MPENTRY_PADDR：
+	code = KADDR(MPENTRY_PADDR);
+	memmove(code, mpentry_start, mpentry_end - mpentry_start);
+但是，编译器会以mpentry.S中的mpentry_start作为基地址，为重定位符号赋予32位高地址。通过使用MPBOOTPHYS宏，我们让重定位符号保持正确相对于MPENTRY_PADDR的偏移。
+实验：将MPBOOTPHYS的定义改为保持原值，结果在make的时候产生了错误"relocation truncated to fit: R_386_16 against `.text'"。
+
+Per-CPU State and Initialization
+【5.png】
+对于mem_init_mp，需要为每个CPU调用boot_map_region，在合适的地址分配内核栈。我定义了宏以便表示第num个CPU的内核栈的地址。
+#define _KSTACKTOP(num) (KSTACKTOP - (num)*(KSTKSIZE + KSTKGAP))
+对于trap_init_percpu，只用将其之前使用的"ts"换成"thiscpu->cpu_ts"即可。前者是单处理器所使用的唯一Taskstate，后者则是当前CPU的Taskstate。
+
+Locking
+【8.png】
+按照writeup所说，在四个地方分别加上lock_kernel或者unlock_kernel即可。
+【9.png】
+如果所有CPU共享同一个内核栈，那么当两个CPU上运行的两个用户进程同时发生中断时，它们将同时进入trapentry.S。由于真正的lock_kernel操作在之后的trap里才会执行，因此它们会在_alltraps这里发生竞争，以不可预测的顺序向内核栈压入各自的寄存器，从而产生错误。
+既然如此，为什么不在trapentry.S处就把内核锁上呢？我觉得是因为内核需要分辨中断来源，如果来自用户态才需要上锁。但是要分辨来源，就必须在上锁之前进行判断，从而引入更多的同步问题。既然这样，不如把各CPU的内核栈分开，既合理又方便。
+
+Round-Robin Scheduling
+【10.png】
+按照writeup所说来写，注意取模运算，注意考虑特殊情况。
+【11.png】
+同时创建3个运行yield.c的用户进程，在单个CPU上运行：
+【12.png】
+但是如果在多个CPU上运行就会出错，因此接下来要解决这个问题。
+【13.png】
+3. 因为envs数组的地址范围是[UENVS, UENVS+PTSIZE)，在UTOP之上，而UTOP之上的地址映射在所有用户环境中都一样。
+4. 目前的进程切换是通过系统调用sys_yield完成的，处理它和处理其他中断一样都会进入trap函数，将用户环境的状态保存在其Trapframe结构中。等到该环境再次被调度之时，env_run会调用env_pop_tf将其保存在Trapframe中的状态恢复。
+
+System Calls for Environment Creation
+【14.png】
+这个练习又麻烦又没有技术含量，唯一要注意的就是exofork里面要手动修改一下子进程的返回值：e->env_tf.tf_regs.reg_eax = 0（PS：Linux也是这么干的）。总之我一遍就过了测试，不贴代码了……
+
+Part B: Copy-on-Write Fork
+Setting the Page Fault Handler
+【15.png】
+同上个练习，没啥意思。
+
+Invoking the User Page Fault Handler
+
+这一节的三个练习（9-11）其实是紧密联系着的，只有把缺页的整个处理过程搞懂了才能一口气写出。下面我们来描述一下JOS对缺页的处理过程。
+首先是硬件层面。缺页发生的时机，是CPU执行一条需要访存的指令时。CPU将逻辑地址传递给MMU，MMU查询页表。如果对应的页表条目“不恰当”（页面无效/权限不够...），那么就会产生缺页异常。之后的处理过程就和之前在Lab 3讨论过的一样了。
+在Lab 3里，所有中断处理函数都在内核态下编写和执行，但是JOS希望实现一种用户级的缺页处理函数。换句话说，进程可以自定义一个在用户空间执行的函数来处理缺页。当然，这个函数会用到各种各样的系统调用（上一节实现的就是它们）。
+
+JOS给出的具体方案是：
+1. 在用户空间额外分配一个“用户异常栈”；
+2. 缺页异常发生后，内核定义的处理函数page_fault_handler将Trapframe保存的进程状态复制一份到用户异常栈中，参见inc/trap.h定义的UTrapframe结构；
+3. 跳转到用户函数_pgfault_upcall，该函数调用用户进程自定义的处理函数_pgfault_handler，然后通过用户异常栈恢复状态，最后返回到刚才产生异常的指令继续执行。
+
+下面分别看看各个函数的实现细节。
+【16.png】
+【17.png】
+进程因缺页异常陷入内核后，会通过trap_dispatch进入该函数。它首先判断该缺页异常是不是另一个缺页异常的处理函数产生的，然后分情况（后面会解释原因）计算新的栈顶。栈顶不能越界（用户异常栈仅一页大小），并且栈必须可写。然后该函数将Trapframe中的状态复制到用户异常栈的栈顶，并修改Trapframe中保存的栈顶和返回地址。这样，进程回到了用户态，但并不是回到产生异常的那条指令，而是在用户态执行的处理函数_pgfault_upcall。
+【18.png】
+【19.png】
+lib/pfentry.S定义了_pgfault_upcall，它首先调用用户进程自己注册的处理函数_pgfault_handler，然后着手从UTrapframe恢复到原来的状态。
+整个恢复过程其实是在模仿kern/env.c定义的env_pop_tf：将%esp修改到某数据结构的开头，然后利用POP指令将其内容传递给寄存器。我们需要好好分析一下此时用户异常栈的结构，这样才好写汇编代码。
+当我们刚进入_pgfault_upcall时，栈的情况如下（地址从下到上增长）
+		+------------------------------+ 
+ 0x30+%esp----> |           utf_esp            |
+		+------------------------------+ 
+ 0x2c+%esp----> |          utf_eflags          |
+		+------------------------------+ 
+ 0x28+%esp----> |           utf_eip            |
+		+------------------------------+ 
+ 0x24+%esp----> |         utf_regs.eax         |
+		+------------------------------+ 
+ 0x20+%esp----> |         utf_regs.ecx         |
+		+------------------------------+ 
+ 0x1c+%esp----> |         utf_regs.edx         |
+		+------------------------------+ 
+ 0x18+%esp----> |         utf_regs.ebx         |
+		+------------------------------+ 
+ 0x14+%esp----> |         utf_regs.oesp        |
+		+------------------------------+ 
+ 0x10+%esp----> |         utf_regs.ebp         |
+		+------------------------------+ 
+  0xc+%esp----> |         utf_regs.esi         |
+		+------------------------------+ 
+  0x8+%esp----> |         utf_regs.edi         |
+		+------------------------------+ 
+  0x4+%esp----> |           utf_err            |
+		+------------------------------+ 
+  0x0+%esp----> |         utf_fault_va         |
+		+------------------------------+ 
+随后的四条指令调用_pgfault_handler并丢弃了utf_err和utf_fault_va：
+		+------------------------------+ 
+ 0x28+%esp----> |           utf_esp            |
+		+------------------------------+ 
+ 0x24+%esp----> |          utf_eflags          |
+		+------------------------------+ 
+ 0x20+%esp----> |           utf_eip            |
+		+------------------------------+ 
+ 0x1c+%esp----> |         utf_regs.eax         |
+		+------------------------------+ 
+ 0x18+%esp----> |         utf_regs.ecx         |
+		+------------------------------+ 
+ 0x14+%esp----> |         utf_regs.edx         |
+		+------------------------------+ 
+ 0x10+%esp----> |         utf_regs.ebx         |
+		+------------------------------+ 
+  0xc+%esp----> |         utf_regs.oesp        |
+		+------------------------------+ 
+  0x8+%esp----> |         utf_regs.ebp         |
+		+------------------------------+ 
+  0x4+%esp----> |         utf_regs.esi         |
+		+------------------------------+ 
+  0x0+%esp----> |         utf_regs.edi         |
+		+------------------------------+ 
+我们的目的是恢复原来的寄存器。恢复过程的最后一步必须是恢复%eip，否则恢复过程本身就会被打断。现在的问题是，只有RET和JMP指令能恢复%eip。如果用RET，那么%esp必须事先指向utf_eip；如果用JMP，那么必须用一个符号/立即数/普通寄存器来指示跳转位置，但缺页异常发生的位置无法预知，因此不能使用符号或立即数，而普通寄存器此时已被恢复，不能再被覆盖。
+JOS使用了一个巧妙的办法，让%esp在RET之前指向utf_eip，并且在RET之后恢复utf_esp的原值：
+1. 用utf_esp定位到普通用户栈，向其中压入utf_eip；
+2. 恢复普通寄存器和eflags；
+3. popl %esp; ret;
+
+第一步完成后：
+		+------------------------------+ 
+ 0x28+%esp----> |          utf_esp-4           |
+		+------------------------------+ 
+ 0x24+%esp----> |          utf_eflags          |
+		+------------------------------+ 
+ 0x20+%esp----> |           utf_eip            |
+		+------------------------------+ 
+ 0x1c+%esp----> |         utf_regs.eax         |
+		+------------------------------+ 
+ 0x18+%esp----> |         utf_regs.ecx         |
+		+------------------------------+ 
+ 0x14+%esp----> |         utf_regs.edx         |
+		+------------------------------+ 
+ 0x10+%esp----> |         utf_regs.ebx         |
+		+------------------------------+ 
+  0xc+%esp----> |         utf_regs.oesp        |
+		+------------------------------+ 
+  0x8+%esp----> |         utf_regs.ebp         |
+		+------------------------------+ 
+  0x4+%esp----> |         utf_regs.esi         |
+		+------------------------------+ 
+  0x0+%esp----> |         utf_regs.edi         |
+		+------------------------------+ 
+                            异常栈
+	
+                |            ...               |
+		+------------------------------+ 
+   utf_esp----> |            ...               |
+		+------------------------------+ 
+ utf_esp-4----> |           utf_eip            |
+		+------------------------------+ 
+                            普通栈  
+第二步完成后：
+		+------------------------------+ 
+      %esp----> |          utf_esp-4           |
+		+------------------------------+ 
+                            异常栈
+	
+                |            ...               |
+		+------------------------------+ 
+   utf_esp----> |            ...               |
+		+------------------------------+ 
+ utf_esp-4----> |           utf_eip            |
+		+------------------------------+ 
+                            普通栈  
+相信聪明的你已经看出来了：第三步的popl %esp会将%esp恢复为utf_esp-4，而该处指向utf_eip。接下来的RET指令相当于popl %eip，用一条指令将两个寄存器同时恢复到了原值。
+那么，为什么popl %esp的执行顺序是先读出%esp指向的数值，再增加%esp，最后将该值写入%esp？这就得问x86的设计者了：
+The POP ESP instruction increments the stack pointer (ESP) before data at the old top of stack is written into the destination. 
+
+IF StackAddrSize = 32
+THEN
+IF OperandSize = 32
+THEN
+DEST ← SS:ESP; (* Copy a doubleword *)
+ESP ← ESP + 4;
+(Intel® 64 and IA-32 Architectures Software Developer’s Manual, Vol. 2B 4-385)
+【20.png】
+【21.png】
+该函数由用户进程调用，用于注册自定义的缺页处理函数，接下来的fork会自己注册一个pgfault来实现写时拷贝。上面写了那么多，这里就显得太简单了，我就不多解释了……
+【22.png】
+这三个函数合起来实现了具有COW性质的用户级fork函数，需要注意的是，由于它们都在用户空间执行，因此需要多次使用之前实现的系统调用，并用特殊的方式读取页表。为此我定义了两个宏，具体原理不再赘述。
+#define GET_PDE(addr)	*(pde_t *)(uvpd + ((uint32_t)(addr) >> PDXSHIFT))
+#define GET_PTE(addr)	*(pte_t *)(uvpt + ((uint32_t)(addr) >> PTXSHIFT))
+
+先来看pgfault，一个实现了COW的缺页异常处理函数。该函数的主要流程如下：
+1. 根据utf_fault_va和utf_err判断这次异常是否源于对COW页面的写操作。如果不是，直接杀死进程；
+2. 申请一个新的物理页面，把它映射到PFTEMP处，再把异常页面的内容复制到该页面上；
+3. 将该物理页面再次映射到与异常页面一样的地址，取消页面的COW属性，并增加W属性。映射之后，新页面即可接收写操作。
+【23.png】
+再来看duppage，它并不分配新的物理页面，而是复制页面的映射关系。如果该页面在原进程中是可写/COW的，那么新映射和原映射都要设置成COW，并取消W属性。
+【24.png】
+最后看fork，它通过各种系统调用创建新进程：
+1. sys_exofork为新进程分配了页表，初始化了寄存器，设置了恰当的状态，并设置了地址空间的内核部分。这些信息全部存储在对应的Env结构中。此时进程尚未拥有自己的用户空间；
+2. 遍历父进程的用户空间的页表，用duppage处理可写/COW的页面，用sys_page_map处理只读页面；
+3. sys_env_set_pgfault_upcall设置页面异常的内核入口；
+4. sys_page_alloc为子进程的用户异常栈分配新的物理页面；
+5. sys_env_set_status允许子进程被调度上CPU。此时，由于子进程共享了父进程的状态、代码和地址空间，因此被调度上CPU后，会从sys_exofork返回，继续执行fork。
+代码有些长，不浪费篇幅贴图了。
+
+Part C: Preemptive Multitasking and Inter-Process communication (IPC)
+Clock Interrupts and Preemption
+【25.png】
+没意思。加几句话，然后在env_alloc里设置FL_IF位即可。
+【26.png】
+没意思，只用加两句话，但是这里依然花费了我一天。
+先是发现陷入内核时中断没被屏蔽。无助调查几小时后，我发现JOS并不区分中断和异常，所有中断门的istrap都应该是0。但我按照Intel手册，将一些中断门的istrap设置成了1，于是从它们进入内核时，IF位并不会被清零。
+然后发现时钟中断只触发一次后就没了。无助调查几小时后，我发现了一个惊天大秘密：在trap_dispatch中，我用switch分支中断而不是用if，因此代码结构和原版有些不同。从Lab 3更新到Lab 4之后，有一段注释被更新到了一个不起眼的位置：
+// Handle clock interrupts. Don't forget to acknowledge the
+// interrupt using lapic_eoi() before calling the scheduler!
+// LAB 4: Your code here.
+它位于我的switch语句下方，但我的注意力完全集中在了switch里，根本没看到这里的注释。
+第二天，我加上lapic_eoi，过了。
+
+Inter-Process communication (IPC)
+【27.png】
+有了kernel_lock，我们不必考虑同步问题，直接按照指示写就行了。
+sys_ipc_recv比较简单，但是sys_ipc_try_send需要注意一些细节。首先，虽然我们有现成的sys_page_map能映射页面，但这里不能用，因为后者会检查envid的合法性，而我们并不想检查。我们只能复制一份与sys_page_map几乎一样的代码过来。其次，由于sys_ipc_recv并不通过"return"返回，我们要在消息发送成功后，修改接收者的%eax，使它返回0。
+ipc_recv和ipc_send很简单，不多说。注意，当我们不想传递页面时，我们应该把传递给系统调用的srcva/dstva参数设置得足够大（大于UTOP），而不是0。
+
+好事多磨。在最后的测试阶段，我又接连碰到了两个奇怪的BUG，又耗费了我一天多的时间，但讽刺的是我只因此修改了三行代码。
+第一个是sendpage在单CPU上能100%成功运行，但在多CPU上有一定概率产生奇怪的错误。无助调查一天后发现原因：某if语句的判断条件有误。
+第二个是primes测试程序莫名卡死。又是一顿调查，发现是刚才修改sched_yield时多删了一句话。
+
+最后写几句感想。调试的关键在于锁定错误范围，因此调试小程序好比探囊取物，调试内核犹如海底捞针。但内核难于调试并不只源于代码规模：中断细节难以观察，同步问题难以定位，硬件信息难以读取……哪怕你只是粗心写错了某一行，你都需要花费大量精力定位。试想，如果JOS没有提供那些细致的测试程序，整个Lab写下来，我们得花多久去定位错误？真是难以想象。
+是否能为每个函数都编写一个完美的测试程序？我想这是件矛盾的事情。要想编写一个完美的测试程序，我首先要知道有哪些错误原因。但如果我知道了所有可能的错误原因，我还要测试程序干什么？当然，在一个共享和开源的环境下，人们可以通过不断完善测试程序来让调试更加方便。但是代码本身可以被拆分/合并/修改，那么在这之后，原来的测试程序还能有效吗？
+所以，测试程序只能建立在一个个已知的错误之上，只能作为“前车之鉴”。它并不能测试出一切可能的错误。
+内核开发之难由此可见一斑。JOS和Linux不同，前者已经固定了一个框架，错误范围已经够小了，而后者永远都有新的东西加入，永远都有潜伏着的错误。光是想看懂Linux的核心代码就已经够难了，更别提调试和开发了。
+
+注：为了迎合评分系统对输出格式的要求，我偶尔会做一些无关紧要的特判，并在后面注释"make grading system happy"。
+

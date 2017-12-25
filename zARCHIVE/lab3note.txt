@@ -1,0 +1,113 @@
+Part A: User Environments and Exception Handling
+
+Allocating the Environments Array
+【1.png】
+仿照Lab2的思路，依次加上
+envs = boot_alloc(NENV * sizeof(struct Env));
+memset(envs, 0, NENV * sizeof(struct Env));
+
+boot_map_region(kern_pgdir, UENVS, NENV * sizeof(struct Env), PADDR(envs), PTE_U | PTE_P);
+即可。
+
+Creating and Running Environments
+【2.png】
+debug: 
+set a GDB breakpoint at env_pop_tf, use si
+the processor should enter user mode after the iret instruction
+You should then see 'cmpl' at the "start" in lib/entry.S
+use "b *0x..." to set a breakpoint at "int $0x30" in sys_cputs() in hello (see obj/user/hello.asm for the user-space address)
+
+r = -E_NO_MEM; panic("env_alloc: %e", r); will panic with the message "env_alloc: out of memory".
+
+env_init就仿照page_init那样写就好了，只不过这一次要求链表顺序是正向的。
+【3.png】
+写env_setup_vm的时候出现了一个小错误。文档里说任何环境在UTOP之上的内存映射是完全一致的，因此我本来想用循环手动设置e->env_pgdir里的条目，例如这样：
+for(i = KERNBASE/PTSIZE; i < NPDENTRIES; i++)
+	e->env_pgdir[i] = PADDR((void *)(i*PTSIZE)) | PTE_P | PTE_U | PTE_W;
+但是在后来的测试中，程序总是出错。我用各种调试方法，追溯到了这个函数，发现了问题所在。我本来的目的是要把kern_pgdir的条目拷贝过来，但kern_pgdir的条目里存放的是页表页的物理地址，而页表页是通过pgdir_walk调用page_alloc分配得来的，并不满足PADDR宏的简单线性关系。
+课程资料里的报告用很简单的方式解决了这一问题：用memcpy和memset。
+【4.png】
+region_alloc对应于boot_map_region，都要将给定大小的物理地址映射到虚拟地址空间。但不同的是，region_alloc在映射之前还要分配页面，这两点分别用page_alloc和page_insert就能做到，代码如下。
+（但是我认为这里有隐患存在。在下面的for循环中，如果某次page_insert失败了，那么之前分配的页面怎么办？还能收回吗？我暂时没有想出办法回退到进入for循环之前的状态。即便有，那也过于复杂。）
+【5.png】
+【该函数是用来干什么的？】虽然文档描述了实现该函数的步骤，但是我还是不知道从何起手。我回头找了一下调用关系，观察到调用链：
+i386_init()
+env_create(user_hello, ENV_TYPE_USER), env_run(&envs[0])
+env_alloc(&e, 0), load_icode(e, binary)]
+调用load_icode是在env_alloc之后，env_run之前。env_alloc为一个环境的运行申请了足够的地址空间，并初始化Env结构，但它并不关心接下来会运行什么程序；而env_run则在该环境上CPU运行之前做准备，同样不关心该环境具体运行的程序。因此，load_icode的作用是指定该环境要运行的代码。
+【ELF头在哪里？】由参数binary指定。
+【Env结构如何与某个ELF头部关联？】struct Env有成员struct Trapframe env_tf(inc/env.h,47)，后者又有成员uintptr_t tf_eip(inc/trap.h,67)。我目前不愿深究这两个结构之间联动的原理，但显然Trapframe结构是用来记录Env结构的寄存器信息的。也许后面写中断处理程序的时候，这个问题会豁然开朗。
+【如何按照ELF头为程序分配地址空间？】文档提示我去看boot/main.c，于是我仿照里面bootmain()从磁盘读取程序头部的方法，结合文档的信息，完成了地址空间的分配。该文件最后一句((void (*)(void)) (ELFHDR->e_entry))()也起到了提示作用。
+【关于用谁的地址空间】文档中让我注意"which page directory should be in force"，提醒我每个环境（包括内核）都有自己的页表。如果我要为某个环境的代码分配虚拟地址空间，为它设置程序入口，当然要用它自己的页表，而不能用内核的。
+现在对比一下内核与用户环境的地址空间。根据env_setup_vm的要求，无论是什么环境，UTOP以上的映射关系都一样。虽然参数e和binary是来自内核的地址，但它们处于UTOP以上，因此不必区分内核与用户。
+如果一直不切换CR3的内容，那么程序会在memset((void *)ph->p_va, 0, ph->p_memsz)处出错。这一点并不难理解：ph->p_va的值落在了UTOP之下，前一句region_alloc只为该环境的页表建立了相关映射，但内核的页表并没有，因此memset在解引用时会产生page fault。
+我在程序开头切换页表之后便不再切换回来，因为之后CPU会切换到用户态，而且该函数不会再被调用。
+【6.png】
+
+env_create和env_run就按照文档的描述来就好了，没有难度。
+【7-8.png】
+Handling Interrupts and Exceptions
+【9.png】
+这个练习我做了两天之久，主要时间都用花在理解x86的中断原理和JOS的实现代码上，此外还在一个很可笑的地方debug了非常久。
+【x86的中断原理(general)】这个部分的内容，操作系统理论课上已经讲过了，但还是提一下。
+在每个指令边缘，如果有中断产生，x86处理器都会暂停当前的指令流，转而去处理中断。
+首先，它依靠硬件措施得到一个中断向量（类似于索引），然后以IDTR为基址，读出一个门描述符。该描述符可能是“中断门”，“陷阱门”或“任务门”(此作业不涉及)，但无论如何它们都包含特权级DPL，段选择符sel和段偏移量offset。
+【10.png】
+CPU以GDTR为基址，sel为索引，读出段描述符desc，从而得到段基址base。用base加上offset，就得到了中断处理函数的入口地址。
+【11.png】
+然后，x86处理器会试图保存进入中断前的机器状态。如果当前CS段的特权级CPL
+	大于DPL：CPU根据任务寄存器(TR)找到任务状态段(TSS)，再根据其中的SS0和ESP0字段找到新的栈顶地址，然后依次压入旧的SS, ESP, EFLAGS, CS, EIP，并更新SS，ESP。
+	等于DPL：不发生堆栈切换，只在当前栈压入旧的EFLAGS, CS, EIP；
+	小于DPL：产生General Protection Fault；
+然后，如果该中断产生了错误码，CPU会再把它压栈；如果门描述符属于“中断门”，新EFLAGS.IF会被清零。
+【12.png】
+最后，CPU切换CS和EIP，进入中断处理程序。
+【JOS与x86的配合】
+首先，JOS要负责初始化IDTR以及IDT的内容，这由trap_init完成。该函数使用多次SETGATE宏，再调用trap_init_percpu()。
+SETGATE宏通过位运算为一个门描述符赋值，例如SETGATE(idt[T_DIVIDE], 1, GD_KT, do_divide, 0)以GD_KT为段选择符，do_divide为偏移量，1为陷阱类型，0为特权级，包装出一个struct Gatedesc条目，赋给idt[T_DIVIDE]。（T_*是定义在inc/trap.h中的宏，数值上对应x86的中断向量。do_*是JOS声明在inc/trap.h中的中断处理函数，在trapentry.S中实现。）
+trap_init_percpu()将TSS的esp0和ss0设置为内核栈顶，设置好对应的GDT表项，以及TR和IDTR。值得注意的是，lidt(&idt_pd)将struct Pseudodesc idt_pd的地址装入IDTR，而该结构刚好符合IDTR的位分布，即base+lim。
+
+其次，JOS要为用户进程保存其他状态，例如普通寄存器。JOS希望把这些状态保存在Env结构中的Trapframe结构中。这里要指出一点，就是Trapframe结构与中断处理函数其实都遵循一个总的设计思路，那就是配合CPU，在CPU完成的工作的基础上，向内核栈中继续压入各种信息，使栈中内容的分布刚好与Trapframe匹配。我借助张弛学长的报告才看出这一点。（__attribute__((packed))告诉编译器为该结构取消自动字节对齐。）
+【14.png】
+回顾上面所说的CPU完成的任务，仔细观察：压栈顺序SS, ESP, EFLAGS, CS, EIP刚好与Trapframe相反（栈向低地址增长）;再看trapentry.S所定义的两个宏，它们压入的内容分别对应Trapframe的tf_err和tf_trapno.
+【15.png】
+明白了这些之后，再根据writeup的提示，就可以写出_alltrap的代码了。先按照Trapframe压入%ds和%es，再用pushal压入所有普通寄存器（压入顺序与Pushreg结构对应），然后更新%ds和%es，并把栈顶指针作为参数传递给trap，该指针刚好指向一个完整的Trapframe。最后，trap用curenv->env_tf = *tf完成了整个状态的保存过程。
+【16.png】
+接下来的任务是定义每个具体的中断处理函数。从处理函数返回后，trap调用env_run，后者再调用env_pop_tf恢复状态（原理与保存状态时类似）。以上就是x86与JOS共同实现的中断机制。
+[17.png]
+1. 如果所有中断都共享处理函数，那么该函数要么对所有中断都执行同样的操作，要么必须有中断向量作为参数。前者的功能不实用，后者无法实现（中断向量无法显式获取）。
+2. Writeup里有句话"In JOS, all exceptions are handled in kernel mode, privilege level 0."，也就是说用户程序不应该主动使用int指令，否则会触发general protection fault。
+至于为什么不允许用户进程执行int $0x14，可以在Intel64手册6.4.2中找到原因：If INT n provides a vector for one of the architecturally-defined exceptions, the processor generates an interrupt to the correct vector (to access the exception handler) but does not push an error code on the stack. This is true even if the associated hardware-generated exception normally produces an error code. The exception handler will still attempt to pop an error code from the stack while handling the exception. Because no error code was pushed, the handler will pop off and discard the EIP instead (in place of the missing error code). This sends the return to the wrong location.
+如果一定要允许int $0x14在用户态执行，那么只用在SETGATE语句里修改权限值为3即可。这样做的后果就是传递给trap的Trapframe内部错位，等用户进程恢复状态之后可能产生错误，但目前没有什么特别的表现。
+【题外话】
+这个练习花费了我非常久的时间，保守估计约有20小时，这其中包括阅读Intel手册，阅读JOS代码，以及调试bug等等。
+第一，我第一次切身体会到操作系统作为“软件与硬件的边界”的特点。每一个操作系统都必须建立在一个特定的体系结构上，如果不了解体系结构，就不可能写出对应的操作系统。例如，JOS建立在x86上，x86从哪里启动，MMU如何寻址，针对中断做了什么工作，用到了什么数据，JOS就必须配合它写出相应的程序。因此，如果想成为内核开发人员，就必须熟悉相关的体系结构。
+第二，内核调试，工具比思考重要。由于内核与底层硬件联系紧密，有很多bug用一般的调试软件都检查不出。而且内核体积庞大，往往牵一发而动全身，很难定位错误的源头。例如，我曾发现我的user_divzero无论如何都进不到do_divide处理函数去。我想跟着除零指令进入内核，却发现gdb不支持这种功能。于是我又花了很长时间排查，包括检查IDTR（gdb的info reg不支持查看IDTR，我自己写了一个sidt函数），检查idt数组，甚至怀疑过JOS源码本身有问题。最后，无助的我发现QEMU有记录中断的功能。我在中断日志中发现除零异常后竟然紧接着page fault，错误码显示原因是内核写。又过了好久，我找到了错误的源头，修正了页表的读写权限，才终于解决这一bug。如果没有QEMU的这个功能，我也许永远都想不到这一点。因此，使用强力的调试工具对于调试内核至关重要。这有点像大海捞针，如果有一个强力磁铁，针立刻就能浮出水面。但如果用肉眼观察，用渔网捞，希望实在渺茫。
+
+Part B: Page Faults, Breakpoints Exceptions, and System Calls
+Handling Page Faults
+【18-19.png】
+只需在trap_dispatch中加一个条件判断语句即可。
+【20.png】
+3. 为了使int $0x3能被用户程序调用，应该在SETGATE里修改其权限值为3，否则会引发general protection fault。
+4. 应当为各个中断设置适当的权限，以避免错误的调用。
+
+System calls
+【21.png】
+仿照其他中断，增加TRAPHANDLER_NOEC和SETGATE等语句即可让系统调用进入正确的处理函数。该处理函数最后会在trap_dispatch中调用syscall函数。按照规定，用户进程陷入内核之前可以在寄存器里放置参数，因此我们还要将它们从Trapframe中读取出来，作为syscall的参数。
+进入syscall之后，还要根据%eax提供的系统调用号进行分支。
+testbss最后一步没有引发page fault：吸取教训，info mem检查地址空间，对比objdump -x的信息，发现多了一页；返回检查load_icode，最终将错误定位到region_alloc "i <= end" -> "i < end"，BINGO！
+【22.png】
+值得注意的是，lib文件夹下同样有一个syscall.c文件，里面也有一个同名的syscall函数。但是区别在于kern/syscall.c的函数处于kernel text段，只能在内核态调用；lib/syscall.c的函数处于user text段，是提供给用户进程的库函数。
+User-mode startup
+【23.png】
+只用将thisenv改为&envs[ENVX(sys_getenvid())]即可。
+Page faults and memory protection
+【24.png】
+CS段寄存器的低两位是指令特权级，0级为内核态，3级为用户态。在page_fault_handler里判断一下即可。
+user_mem_check也不难实现。为了make grade方便，我加了一句特殊判定，只稍微影响了user_mem_check_addr——反正也只是调试用的。
+最后，在对应的地方加上user_mem_check就能避免用户指针越权访问了。
+为什么backtrace会使内核产生page_fault？
+【25.png】
+
+
