@@ -372,9 +372,6 @@ trap(struct Trapframe *tf)
 void
 page_fault_handler(struct Trapframe *tf)
 {
-static int count = 0;
-count++;
-cprintf("%d\n", count);
 	uint32_t fault_va;
 
 	// Read processor's CR2 register to find the faulting address

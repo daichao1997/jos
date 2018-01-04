@@ -32,7 +32,7 @@ sched_yield(void)
 	// Search for a runnable env, starting from the last running env
 	// If there is no running env, start from the beginning of envs[]
 	int last, i;
-//cprintf("I am CPU %d: ", cpunum());
+	
 	if(curenv) {
 		last = ENVX(curenv->env_id);
 		i = (last+1) % NENV;
@@ -41,20 +41,15 @@ sched_yield(void)
 	
 	do {
 		if(envs[i].env_status == ENV_RUNNABLE) {
-//cprintf("pick the runnable env %08x at %08x\n", envs[i].env_id, envs[i].env_tf.tf_eip);
 			env_run(&envs[i]);
 			break;
 		}
 		i = (i+1) % NENV;
 	} while(i != last);
 
-	// If no envs are runnable, choose the currently running one ON THIS CPU
-	if(curenv && curenv->env_status == ENV_RUNNING) {
-//cprintf("no runnable env, pick %08x at %08x\n", curenv->env_id, curenv->env_tf.tf_eip);
+	if(curenv && curenv->env_status == ENV_RUNNING)
 		env_run(curenv);
-	}
-	// sched_halt never returns
-//cprintf("halt it\n");
+
 	sched_halt();
 }
 

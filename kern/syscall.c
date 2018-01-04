@@ -4,6 +4,7 @@
 #include <inc/error.h>
 #include <inc/string.h>
 #include <inc/assert.h>
+#include <inc/elf.h>
 
 #include <kern/env.h>
 #include <kern/pmap.h>
@@ -246,17 +247,22 @@ sys_page_map(envid_t srcenvid, void *srcva,
 	if(((uint32_t)srcva >= UTOP) || (PGOFF(srcva) != 0) ||
 			((uint32_t)dstva >= UTOP) || (PGOFF(dstva) != 0))	// va >= UTOP, or va is not page-aligned.
 		return -E_INVAL;
+
 	if((perm & (PTE_U | PTE_P)) != (PTE_U | PTE_P))	// PTE_U | PTE_P must be set
 		return -E_INVAL;
+
 	if(perm & ~PTE_SYSCALL)	// only the bits in PTE_SYSCALL may be set
 		return -E_INVAL;
+
 	if(!(pp = page_lookup(esrc->env_pgdir, srcva, &entry)))	// srcva is not mapped
 		return -E_INVAL;
+
 	if(perm & ~(*entry) & PTE_W) // no write access to a read-only page
 		return -E_INVAL;
 
 	if((r = page_insert(edst->env_pgdir, pp, dstva, perm)) < 0)
 		return r;
+
 	return 0;
 }
 
@@ -394,6 +400,41 @@ sys_ipc_recv(void *dstva)
 	return 0;
 }
 
+static int
+sys_exec(struct Elf *elf, uintptr_t esp) {
+	int perm, i, r;
+	uint32_t tmp_addr = 0xE0000000;
+	uint32_t va, end;
+	struct PageInfo * pg;
+	struct Proghdr *ph = (struct Proghdr *)((char *)elf + elf->e_phoff);
+	// Set trapframe first
+	curenv->env_tf.tf_eip = elf->e_entry;
+	curenv->env_tf.tf_esp = esp;
+	// Map each program header from temporary address to target address
+	for (i = 0; i < elf->e_phnum; i++, ph++) {
+		if (ph->p_type != ELF_PROG_LOAD)
+			continue;
+		perm = PTE_P | PTE_U;
+		if (ph->p_flags & ELF_PROG_FLAG_WRITE)
+			perm |= PTE_W;
+
+		end = ROUNDUP(ph->p_va + ph->p_memsz, PGSIZE);
+		for (va = ROUNDDOWN(ph->p_va, PGSIZE); va != end; tmp_addr += PGSIZE, va += PGSIZE) {
+			if((r = sys_page_map(0, (void *)tmp_addr, 0, (void *)va, perm)) < 0)
+				return r;
+			page_remove(curenv->env_pgdir, (void *)tmp_addr);
+		}
+	}
+	// The stack must not be mapped until we have set the trapframe and mapped all program headers,
+	// or the argument 'elf' stored in the stack would be overridden.
+	if((r = sys_page_map(0, (void *)tmp_addr, 0, (void *)(USTACKTOP - PGSIZE), PTE_P | PTE_U | PTE_W)) < 0)
+		return r;
+	page_remove(curenv->env_pgdir, (void *)tmp_addr);
+	// This never returns, so we don't need return address, which was stored in the original stack
+	env_run(curenv);
+	return 0;
+}
+
 // Dispatches to the correct kernel function, passing the arguments.
 int32_t
 syscall(uint32_t syscallno, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5)
@@ -432,6 +473,8 @@ syscall(uint32_t syscallno, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, 
 			return sys_ipc_try_send(a1, a2, (void *)a3, a4);
 		case SYS_ipc_recv:
 			return sys_ipc_recv((void *)a1);
+		case SYS_exec:
+			return sys_exec((struct Elf *)a1, a2);
 		default:
 			return -E_INVAL;
 	}

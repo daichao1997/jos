@@ -4,6 +4,7 @@
 #include <inc/lib.h>
 
 uint32_t val;
+//#define thisenv_s ((struct Env *)(&envs[ENVX(sys_getenvid())]))
 
 void
 umain(int argc, char **argv)

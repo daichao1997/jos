@@ -6,7 +6,7 @@
 #define UTEMP3			(UTEMP2 + PGSIZE)
 
 // Helper functions for spawn.
-static int init_stack(envid_t child, const char **argv, uintptr_t *init_esp);
+static int init_stack(envid_t child, const char **argv, uintptr_t *init_esp, uint32_t dst);
 static int map_segment(envid_t child, uintptr_t va, size_t memsz,
 		       int fd, size_t filesz, off_t fileoffset, int perm);
 static int copy_shared_pages(envid_t child);
@@ -107,7 +107,7 @@ spawn(const char *prog, const char **argv)
 	child_tf = envs[ENVX(child)].env_tf;
 	child_tf.tf_eip = elf->e_entry;
 
-	if ((r = init_stack(child, argv, &child_tf.tf_esp)) < 0)
+	if ((r = init_stack(child, argv, &child_tf.tf_esp, USTACKTOP - PGSIZE)) < 0)
 		return r;
 
 	// Set up program segments as defined in ELF header.
@@ -175,6 +175,113 @@ spawnl(const char *prog, const char *arg0, ...)
 	return spawn(prog, argv);
 }
 
+int exec(const char *prog, const char **argv) {
+	unsigned char elf_buf[512];
+	uintptr_t tmp_esp;
+
+	int fd, i, r;
+	struct Elf *elf;
+	struct Proghdr *ph;
+	int perm;
+
+	uint32_t tmp_addr = 0xE0000000;
+
+	if ((r = open(prog, O_RDONLY)) < 0)
+		return r;
+	fd = r;
+
+	// Read elf header
+	elf = (struct Elf*) elf_buf;
+	if (readn(fd, elf_buf, sizeof(elf_buf)) != sizeof(elf_buf)
+	    || elf->e_magic != ELF_MAGIC) {
+		close(fd);
+		cprintf("elf magic %08x want %08x\n", elf->e_magic, ELF_MAGIC);
+		return -E_NOT_EXEC;
+	}
+/*
+	// Create new child environment
+	if ((r = sys_exofork()) < 0)
+		return r;
+	child = r;
+
+	// Set up trap frame, including initial stack.
+	child_tf = envs[ENVX(child)].env_tf;
+	child_tf.tf_eip = elf->e_entry;
+*/
+
+	
+
+	// Set up program segments as defined in ELF header.
+	ph = (struct Proghdr*) (elf_buf + elf->e_phoff);
+	for (i = 0; i < elf->e_phnum; i++, ph++) {
+		if (ph->p_type != ELF_PROG_LOAD)
+			continue;
+		perm = PTE_P | PTE_U;
+		if (ph->p_flags & ELF_PROG_FLAG_WRITE)
+			perm |= PTE_W;
+
+		// Load each segment to a seperated page, keeping its offset
+		if ((r = map_segment(0, tmp_addr + PGOFF(ph->p_va), ph->p_memsz,
+				     fd, ph->p_filesz, ph->p_offset, perm)) < 0)
+			goto error;
+
+		tmp_addr += ROUNDUP(PGOFF(ph->p_va) + ph->p_memsz, PGSIZE);
+	}
+	
+	if ((r = init_stack(0, argv, &tmp_esp, tmp_addr)) < 0)
+		return r;
+	sys_exec(elf, tmp_esp);
+	close(fd);
+	fd = -1;
+/*
+	// Copy shared library state.
+	if ((r = copy_shared_pages(child)) < 0)
+		panic("copy_shared_pages: %e", r);
+
+	//child_tf.tf_eflags |= FL_IOPL_3;   // devious: see user/faultio.c
+	if ((r = sys_env_set_trapframe(child, &child_tf)) < 0)
+		panic("sys_env_set_trapframe: %e", r);
+
+	if ((r = sys_env_set_status(child, ENV_RUNNABLE)) < 0)
+		panic("sys_env_set_status: %e", r);
+*/
+
+	return 0;
+
+error:
+	sys_env_destroy(0);
+	close(fd);
+	return r;
+}
+
+int
+execl(const char *prog, const char *arg0, ...)
+{
+	// We calculate argc by advancing the args until we hit NULL.
+	// The contract of the function guarantees that the last
+	// argument will always be NULL, and that none of the other
+	// arguments will be NULL.
+	int argc = 0;
+	va_list vl;
+	va_start(vl, arg0);
+	while(va_arg(vl, void *) != NULL)
+		argc++;
+	va_end(vl);
+
+	// Now that we have the size of the args, do a second pass
+	// and store the values in a VLA, which has the format of argv
+	const char *argv[argc+2];
+	argv[0] = arg0;
+	argv[argc + 1] = NULL;
+
+	va_start(vl, arg0);
+	unsigned i;
+	for(i = 0; i < argc; i++)
+		argv[i+1] = va_arg(vl, const char *);
+	va_end(vl);
+
+	return exec(prog, argv);
+}
 
 // Set up the initial stack page for the new child process with envid 'child'
 // using the arguments array pointed to by 'argv',
@@ -184,7 +291,7 @@ spawnl(const char *prog, const char *arg0, ...)
 // to the initial stack pointer with which the child should start.
 // Returns < 0 on failure.
 static int
-init_stack(envid_t child, const char **argv, uintptr_t *init_esp)
+init_stack(envid_t child, const char **argv, uintptr_t *init_esp, uint32_t dst)
 {
 	size_t string_size;
 	int argc, i, r;
@@ -248,8 +355,9 @@ init_stack(envid_t child, const char **argv, uintptr_t *init_esp)
 
 	// After completing the stack, map it into the child's address space
 	// and unmap it from ours!
-	if ((r = sys_page_map(0, UTEMP, child, (void*) (USTACKTOP - PGSIZE), PTE_P | PTE_U | PTE_W)) < 0)
+	if ((r = sys_page_map(0, UTEMP, child, (void*)dst, PTE_P | PTE_U | PTE_W)) < 0)
 		goto error;
+
 	if ((r = sys_page_unmap(0, UTEMP)) < 0)
 		goto error;
 

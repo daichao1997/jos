@@ -37,3 +37,135 @@ int mon_continue(int argc, char **argv, struct Trapframe *tf) {
 }
 
 Lab 4: Preemptive Multitasking
+[ch4.png]
+这项挑战要求我们在用户层实现一个和fork一样能创建子进程的sfork。两者的区别在于，fork完全分离了父子进程的地址空间，而sfork只分离了栈区域，其他区域则完全共享。因此，用sfork创建的子进程将与父进程共享大部分可写页面，包括堆/全局变量/程序代码等。
+从实现方法来看，共享某个页面只需复制其页表项即可，分离某个页面就要把它设为COW。fork通过调用duppage来将各个页面设置为COW，但是duppage会将所有可写页面都设置为COW，因此sfork应该修改调用duppage的条件。综合考虑后，我参照张弛的报告，实现了sduppage与sfork。
+sduppage比duppage多了一个参数cow，用来强制指定COW。此外，sduppage并不会把可写页面设置为COW。
+[sduppage.png]
+由于栈空间的大小可变，因此sfork需要动态地判断栈顶位置。sfork从栈底USTACKTOP开始，以cow=1的方式向低地址复制页表。在遇到第一个用户不可访问的页面后（说明到了栈顶），sfork开始以cow=0的方式复制，直到UTEXT。
+[sfork.png]
+这时还有一个问题需要考虑。sfork会使父子进程共享所有全局变量，包括指向当前进程PCB的thisenv指针，这样一来，子进程通过thisenv访问到的就会是父进程的PCB，而不是自己的。thisenv指针在lib/libmain.c中定义，是一个const变量，libmain函数被初始化后就不会再改变了。因此，我们需要让进程用别的办法访问自己的PCB。
+在inc/lib.h定义thisenv_s宏：
+	#define thisenv_s ((struct Env *)(&envs[ENVX(sys_getenvid())]))
+然后将所有'thisenv->***'改为'thisenv_s->***'。
+
+让user/forktree.c调用sfork，测试结果正常。
+[forktree.png]
+user/pingpongs.c的测试结果正常。
+[pingpongs.png]
+
+接下来我自己写了一个程序，测试父子进程是否能共同写一个变量，发现了一些有趣的问题。
+Version 1
+让子进程修改变量，父进程等待
+#include <inc/lib.h>
+int a = 1;
+void umain(int argc, char **argv) {
+	int child = sfork();
+	if(child == 0) {
+		cprintf("child: a = %d\n", a);
+		a = 2;
+	}
+	else {
+		while(a == 1) ;
+		cprintf("parent: a = %d\n", a);
+	}
+}
+运行结果：
+	child: a = 1
+	(infinite loop)
+
+Version 2
+相比于version 1，让父进程修改变量，子进程等待
+#include <inc/lib.h>
+int a = 1;
+void umain(int argc, char **argv) {
+	int child = sfork();
+	if(child != 0) {
+		cprintf("parent: a = %d\n", a);
+		a = 2;
+	}
+	else {
+		while(a == 1) ;
+		cprintf("child: a = %d\n", a);
+	}
+}
+运行结果：
+	parent: a = 1
+	child: a = 2
+
+Version 3
+相比于version 1，给变量增加了volatile属性。
+#include <inc/lib.h>
+volatile int a = 1;
+void umain(int argc, char **argv) {
+	int child = sfork();
+	if(child == 0) {
+		cprintf("child: a = %d\n", a);
+		a = 2;
+	}
+	else {
+		while(a == 1) ;
+		cprintf("parent: a = %d\n", a);
+	}
+}
+运行结果：
+	child: a = 1
+	parent: a = 2
+
+Version 4
+相比于version 2，把全局变量变成了局部变量。
+#include <inc/lib.h>
+void umain(int argc, char **argv) {
+	int a = 1;
+	int child = sfork();
+	if(child == 0) {
+		cprintf("child: a = %d\n", a);
+		a = 2;
+	}
+	else {
+		while(a == 1) ;
+		cprintf("parent: a = %d\n", a);
+	}
+}
+运行结果：
+	child: a = 1
+	(infinite loop)
+
+分析：
+我在看了张弛的报告后，也写了一个类似的测试程序(Version 1)，但是得不出正确结果。我检查了自己的sfork与sduppage，均未发现问题。后来我发现，张弛的代码实际上是Version 2，并且能得出正确结果。这实在是太奇怪了：父进程可以修改子进程的变量，子进程却无法修改父进程的变量。
+后来，我联想到thisenv的属性是"const volatile"，这个volatile很值得琢磨。经过查询，发现volatile属性会防止编译器做出aggressive optimization，只从其内存位置访问该变量的“本体”，而不是某个缓存值，因为它可能在当前程序上下文的控制流以外被修改。const volatile属性则表明，用户程序不可通过thisenv修改它指向的PCB，但该PCB可能被内核或其他进程修改，因此也不可做aggressive optimization。
+在我的while循环中，a是靠另一个进程修改的，但编译器可能会先把a的值读入某个寄存器，然后等待那个寄存器的值变化。我将a设为volatile变量后(Version 3)，终于得到了正常结果。
+Version 4的运行结果表明我的sfork没有共享栈空间。
+
+Lab 5: File system, Spawn and Shell
+[ch5.png]
+The exec() family of functions replaces the current process image with a new process image. The initial argument for these functions is the name of a file that is to be executed. The const char *arg can be thought of as arg0, arg1, ..., argn.
+在spawn里，父进程替子进程指定了上下文，但是exec则让进程替换自己的上下文。由于进程无法在用户态修改自己的代码段，因此exec必须通过系统调用陷入内核，然后让内核完成替换工作。
+既然如此，内核肯定要有ELF文件头的信息。
+exec的结构应该是：模仿spawn.c，读取ELF文件头；将程序段映射到临时地址（从0xE0000000开始）；用init_stack初始化栈，获取esp值并映射到临时地址；调用sys_exec陷入内核。
+sys_exec的参数应该有指向ELF文件头的指针，以及init_stack所指示的esp值。设置trapframe，把临时地址的程序段映射到段头所指示的位置，把栈映射到USTACKTOP - PGSIZE。最后用env_run运行新程序。
+测试程序：
+#include <inc/lib.h>
+
+void
+umain(int argc, char **argv)
+{
+	int child = fork();
+	if(child == 0) {
+		if ((r = execl("forktree", "forktree", 0)) < 0)
+			panic("spawn(forktree) failed: %e", r);
+	}
+}
+结果：[ch5-test.png]
+[sysexec.png]
+[exec.png]
+execl: return exec(prog, argv);
+init_stack: 增加参数uint32_t dst，用于指定栈的位置（之前默认是USTACKTOP - PGSIZE）。
+
+kern/syscall.c: syscall()
+case SYS_exec: return sys_exec((struct Elf *)a1, a2);
+kern/syscall.h
+lib/syscall.c
+inc/lib.h
+inc/syscall.h
+#include <inc/elf.h>

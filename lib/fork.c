@@ -29,7 +29,7 @@ pgfault(struct UTrapframe *utf)
 	//   (see <inc/memlayout.h>).
 	// LAB 4: Your code here.
 	if(!(err & FEC_WR))
-		panic("Not a wirte.\n");
+		panic("Not a write.\n");
 	if(!(pte & PTE_COW))
 		panic("Not a COW page.\n");
 	// Allocate a new page, map it at a temporary location (PFTEMP),
@@ -155,9 +155,76 @@ fork(void)
 }
 
 // Challenge!
+
+static int
+sduppage(envid_t envid, unsigned pn, int cow)
+{
+	int r;
+	// LAB 4: Your code here.
+	pte_t pte, newpte;
+	void *addr = (void *)(pn*PGSIZE);
+
+	if((GET_PDE(addr) & (PTE_U | PTE_P)) == (PTE_U | PTE_P))
+		newpte = pte = GET_PTE(addr);
+	else
+		panic("sduppage: the page table of page pn is not accessible.\n");
+
+	if(pte & PTE_SHARE)
+		return sys_page_map(0, addr, envid, addr, PTE_SYSCALL & PGOFF(pte));
+
+	// permission needs modification if the src-page is copy-on-write or cow != 0
+	if(cow || (pte & PTE_COW))
+		newpte = (pte & ~PTE_W) | PTE_COW;
+	else
+		newpte = pte & ~PTE_COW;
+
+	// map the dest-page first
+	if((r = sys_page_map(0, addr, envid, addr, PTE_SYSCALL & PGOFF(newpte))) < 0)
+		return r;
+
+	if((r = sys_page_map(0, addr, 0, addr, PTE_SYSCALL & PGOFF(newpte))) < 0)
+		return r;
+
+	return 0;
+}
+
 int
 sfork(void)
 {
-	panic("sfork not implemented");
-	return -E_INVAL;
+	envid_t child_id;
+	pte_t pte;
+	uint32_t i;
+	int r;
+	extern void _pgfault_upcall(void);
+
+	set_pgfault_handler(pgfault);
+
+	if((child_id = sys_exofork()) < 0)
+		return child_id;
+
+	if(child_id == 0) {
+		thisenv = &envs[ENVX(sys_getenvid())];
+		return 0;
+	}
+	// go through the page table and copy them
+	int cow = 1;
+	for(i = USTACKTOP - PGSIZE; i >= UTEXT; i -= PGSIZE) {
+		// valid page table entry?
+		if((GET_PDE(i) & PTE_P) > 0 && ((pte = GET_PTE(i)) & PTE_P) > 0 && (pte & PTE_U) > 0) {
+			if((r = sduppage(child_id, i/PGSIZE, cow)) < 0)
+				return r;
+		} else
+			cow = 0;
+	}
+
+	if((sys_env_set_pgfault_upcall(child_id, _pgfault_upcall)) < 0)
+		panic("Can't set page fault upcall.\n");
+	// allocate a new page for user exception stack
+	if((sys_page_alloc(child_id, (void *)UXSTACKTOP- PGSIZE, PTE_U | PTE_W | PTE_P)) < 0)
+		panic("Can't allocate user exception stack.\n");
+	// mark it runnable
+	if((sys_env_set_status(child_id, ENV_RUNNABLE) < 0))
+		panic("Can't set status.\n");
+
+	return child_id;
 }

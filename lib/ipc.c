@@ -30,11 +30,11 @@ ipc_recv(envid_t *from_env_store, void *pg, int *perm_store)
 	r = sys_ipc_recv(dstva);
 
 	if(from_env_store)
-		*from_env_store = r ? 0 : thisenv->env_ipc_from;
+		*from_env_store = r ? 0 : thisenv_s->env_ipc_from;
 	if(perm_store)
-		*perm_store = r ? 0 : thisenv->env_ipc_perm;
+		*perm_store = r ? 0 : thisenv_s->env_ipc_perm;
 
-	return r ? r : thisenv->env_ipc_value;
+	return r ? r : thisenv_s->env_ipc_value;
 }
 
 // Send 'val' (and 'pg' with 'perm', if 'pg' is nonnull) to 'toenv'.

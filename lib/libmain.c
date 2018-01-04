@@ -2,7 +2,7 @@
 // entry.S already took care of defining envs, pages, uvpd, and uvpt.
 
 #include <inc/lib.h>
-
+#define thisenv_s ((struct Env *)(&envs[ENVX(sys_getenvid())]))
 extern void umain(int argc, char **argv);
 
 const volatile struct Env *thisenv;

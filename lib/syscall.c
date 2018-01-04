@@ -2,6 +2,7 @@
 
 #include <inc/syscall.h>
 #include <inc/lib.h>
+#include <inc/elf.h>
 
 static inline int32_t
 syscall(int num, int check, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5)
@@ -117,3 +118,8 @@ sys_ipc_recv(void *dstva)
 	return syscall(SYS_ipc_recv, 1, (uint32_t)dstva, 0, 0, 0, 0);
 }
 
+int
+sys_exec(struct Elf *elf, uintptr_t esp)
+{
+	return syscall(SYS_exec, 0, (uint32_t)elf, (uint32_t)esp, 0, 0, 0);
+}
