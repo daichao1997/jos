@@ -1,0 +1,87 @@
+Lab 5: File system, Spawn and Shell
+
+File system preliminaries
+在展示练习与代码之前，我先简要介绍一下JOS的文件系统，尤其是它具体的实现方案。
+-On-Disk File System Structure
+比UNIX文件系统少了很多特性，例如不区分用户权限，不支持硬链接/时间戳，不使用inode等等
+允许用户程序直接读取文件的元数据，而不需要经过特别的系统调用
+扇区大小512B；块大小4096B，与页面一样大
+block 0是保留块，存放内核的启动代码和分区表，block 1是超级块（superblock），struct Super in inc/fs.h，存放着文件系统的整体属性，例如块大小/磁盘大小，等等
+文件的元数据由struct File in inc/fs.h描述，包括10个直接块，1个间接块。根目录的元数据在Super中
+
+
+The File System
+
+-Disk Access
+[ex1.png]
+在env_create函数中加入分支，使类型为ENV_TYPE_FS的进程获得I/O权限。
+这个练习很简单，但是有必要搞清楚它为什么这么做：JOS想实现工作在用户态的文件系统，但不希望使用磁盘中断，于是它定义了一种特殊的“FS进程”用来接收并处理其他进程的访盘请求。所以，FS进程需要有读写磁盘的权限。
+if(type == ENV_TYPE_FS)
+	e->env_tf.tf_eflags |= FL_IOPL_3;
+else
+	e->env_tf.tf_eflags &= ~FL_IOPL_3;
+[q1.png]
+
+-The Block Cache
+FS进程的访盘原理：该进程首先把整个磁盘（不大于3GB）映射到自己从0x10000000（DISKMAP）到0xD0000000（DISKMAP+DISKMAX）的地址空间，称为“block cache”。当它收到访盘请求时，它实际上会访问自己的block cache，然后分情况处理：
+	如果要访问的地址不在物理内存（PTE_P位为0），就触发page fault，由处理函数bc_pgfault将对应的磁盘块调入内存。由于JOS定义的磁盘块大小和页面大小都是4KB，因此调入的内容刚好能存放在一页之中。
+	接下来，如果请求读磁盘，那么直接读取block cache对应的位置即可；如果请求写磁盘，那么要先写对应位置，再调用flush_block函数把那个页面的内容刷新到磁盘上。
+[ex2.png]
+[code2.png]
+[code2-2.png]
+
+-The Block Bitmap
+[ex3.png]
+在实际应用中，磁盘上的内容总在动态地变化，因此JOS使用位图来表示磁盘块是否空闲，而该位图本身也存放在磁盘上（从block 2开始）。数组bitmap就在block cache中对应着这个位图。
+仿照alloc_block函数的代码，我们很容易就能写出free_block函数。它们只涉及一些简单的位运算。
+[code3.png]
+
+-File Operations
+[ex4.png]
+file_block_walk函数和file_get_block函数是一个接口，两者共同将文件块号翻译成block cache中的地址。但是磁盘上的文件以及元数据是从哪里来的？这一点不必在此详述，我们只需要知道GNUmakefile已经帮我们完成了这些初始化工作。
+在file_block_walk中，我们需要根据文件块号，找到元数据中存放其磁盘块号的条目的地址。该条目可能在f_direct数组中，也可能在间接块指向的磁盘块中。如果是后一种情况，并且间接块无效（条目的值为0），就根据alloc选项决定是否分配一个间接块。该函数和pgdir_walk函数类似，它接受一个虚拟地址，返回对应页表条目的地址，并且有create选项决定是否分配新的页表页。
+[code4-1-1.png]
+[code4-1-2.png]
+接下来，file_get_block函数调用file_block_walk获得条目地址，如果该条目无效，就为它分配一个磁盘块使其有效，并返回它在block cache中的地址。
+[code4-2.png]
+
+-The file system interface
+现在，我们的文件系统已经可以读写磁盘/根据File结构寻找文件数据，但其他用户进程还无法使用这些功能，因此我们需要实现用户进程读写文件的接口。JOS使用了RPC机制，让用户进程能通过FS进程操作文件。
+[rpc.png]
+上图以读文件的read函数为例，介绍了RPC机制是如何分层实现的。
+ssize_t read(int fdnum, void *buf, size_t n)
+static ssize_t devfile_read(struct Fd *fd, void *buf, size_t n)
+static int fsipc(unsigned type, void *dstva)
+用户进程调用read函数，提供文件描述符fd，读入地址buf和要读取的字节数n。read检查参数，确定具体的读取方式（目前只有devfile_read），然后把参数传递给devfile_read。
+devfile_read根据参数填写fsipcbuf的内容，并调用fsipc(FSREQ_READ, NULL)。
+fsipcbuf是一个联合结构体，大小固定为一页。它既为用户进程存放请求内容，又为FS进程存放请求结果。我们之前在Lab 4实现的IPC机制可以在通信的双方之间共享页面，接下来fsipcbuf就会被共享了。
+fsipc函数调用ipc_send，向FS进程发送type参数FSREQ_READ，并与其共享fsipcbuf，然后调用ipc_recv，等待FS进程的回复。
+FS进程此时处于serve()的循环中，在ipc_recv处等待来自用户进程的消息。收到消息后，它会根据消息中的type参数，用不同的方法（用handlers数组记录，这里是serve_read）处理fsipcbuf的内容，然后调用ipc_send，向用户进程发送处理结果。
+serve_read需要调用openfile_lookup找到OpenFile结构，通过该结构能访问到文件的元数据和它在该进程的用户打开文件表中的条目。然后调用file_read访问磁盘，把读取的数据写到fsipcbuf中。
+fsipc收到回复后返回到了devfile_read，它就可以把fsipcbuf的内容复制到buf，完成整个读取文件的过程。
+[handlers.png]
+
+[ex5.png]
+[code5.png]
+[ex6.png]
+[code6.png]
+
+Spawning Processes
+[ex7.png]
+sys_env_trapframe的作用是让用户进程能够自己设置Trapframe（自己或其它进程的），从而让子进程运行其他的程序。
+[code7.png]
+-Sharing library state across fork and spawn
+[ex8.png]
+设置PTE_SHARE位的目的是为了在fork的时候让父子进程共享文件描述符表。在之前的fork中，所有可写的页面都带有PTE_COW属性。因此，如果某一方试图写文件描述符表，另一方并不会受到影响。将希望共享的页面设置成PTE_SHARE，就能阻止fork将这些页面设置成PTE_COW。
+copy_shared_pages函数在spawn的执行过程中起到了类似的作用。
+1. 	if(pte & PTE_SHARE)
+		return sys_page_map(0, addr, envid, addr, PTE_SYSCALL & PGOFF(pte));
+[code8-2.png]
+
+The keyboard interface
+[ex9.png]
+照着做吧。
+The Shell
+[ex10.png]
+照着写吧。
+[code10.png]
